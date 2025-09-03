@@ -44,6 +44,10 @@ import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.framework.options.Options;
+import ghidra.framework.model.DomainObject;
+import ghidra.framework.model.DomainObjectEvent;
+import ghidra.framework.model.DomainObjectListener;
+
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -55,17 +59,31 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
+
+import ghidra.program.model.block.CodeBlock;
+import ghidra.program.model.block.CodeBlockIterator;
+import ghidra.program.model.block.CodeBlockReference;
+import ghidra.program.model.block.CodeBlockReferenceIterator;
+import ghidra.program.model.block.SimpleBlockModel;
+import ghidra.program.model.pcode.PcodeBlockBasic;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.util.exception.CancelledException;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
-    packageName = ghidra.app.DeveloperPluginPackage.NAME,
+    packageName = "ghidra.app.DeveloperPluginPackage.NAME",
     category = PluginCategoryNames.ANALYSIS,
     shortDescription = "HTTP server plugin",
     description = "Starts an embedded HTTP server to expose program data. Port configurable via Tool Options."
 )
-public class GhidraMCPPlugin extends Plugin {
+public class GhidraMCPPlugin extends Plugin implements DomainObjectListener {
 
     private HttpServer server;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
@@ -75,6 +93,21 @@ public class GhidraMCPPlugin extends Plugin {
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
         Msg.info(this, "GhidraMCPPlugin loading...");
+
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm != null) {
+            pm.addProgramListener(new ProgramListener() {
+                @Override
+                public void programOpened(Program program) {
+                    program.addDomainObjectListener(GhidraMCPPlugin.this);
+                }
+
+                @Override
+                public void programClosed(Program program) {
+                    program.removeDomainObjectListener(GhidraMCPPlugin.this);
+                }
+            });
+        }
 
         // Register the configuration option
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
@@ -92,6 +125,13 @@ public class GhidraMCPPlugin extends Plugin {
         Msg.info(this, "GhidraMCPPlugin loaded!");
     }
 
+    @Override
+    public void domainObjectChanged(DomainObjectEvent ev) {
+        if (ev.contains(DomainObject.FILE_CHANGED)) {
+            Msg.info(this, "Program file has changed. Consider regenerating the dataset.");
+        }
+    }
+    
     private void startServer() throws IOException {
         // Read the configured port
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
@@ -341,6 +381,18 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
         });
 
+        // HELIOS dataset endpoints
+        server.createContext("/dataset/binary_metadata", this::sendBinaryMetadataResponse);
+        server.createContext("/dataset/blocks", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getBlocksJson(name) ));
+        server.createContext("/dataset/calls", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getCallsJson(name)));
+        server.createContext("/dataset/c_code", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getCCodeJson(name)));
+        server.createContext("/dataset/cfg", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getCfgJson(name)));
+        server.createContext("/dataset/edges", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getEdgesJson(name)));
+        server.createContext("/dataset/patterns", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getPatternsJson(name)));
+        server.createContext("/dataset/p_code", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getPCodeJson(name)));
+        server.createContext("/dataset/statistics", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getStatisticsJson(name)));
+        server.createContext("/dataset/variables", e -> sendDatasetResponseByName(e, (gen, name) -> gen.getVariablesJson(name)));
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
@@ -351,6 +403,129 @@ public class GhidraMCPPlugin extends Plugin {
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
+    }
+    
+    // ----------------------------------------------------------------------------------
+    // Helper methods for handling requests
+    // ----------------------------------------------------------------------------------
+    private void sendResponse(HttpExchange exchange, String response) throws IOException {
+        exchange.sendResponseHeaders(200, response.getBytes().length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(response.getBytes());
+        }
+    }
+
+    private void sendResponse(HttpExchange exchange, String response, int statusCode) throws IOException {
+        exchange.sendResponseHeaders(statusCode, response.getBytes().length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(response.getBytes());
+        }
+    }
+
+    private Map<String, String> parseQueryParams(HttpExchange exchange) {
+        Map<String, String> params = new HashMap<>();
+        String query = exchange.getRequestURI().getQuery();
+        if (query != null) {
+            for (String param : query.split("&")) {
+                String[] pair = param.split("=");
+                if (pair.length > 1) {
+                    params.put(pair[0], pair[1]);
+                } else {
+                    params.put(pair[0], "");
+                }
+            }
+        }
+        return params;
+    }
+    
+    private Map<String, String> parsePostParams(HttpExchange exchange) throws IOException {
+        Map<String, String> params = new HashMap<>();
+        String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        for (String param : body.split("&")) {
+            String[] pair = param.split("=");
+            if (pair.length > 1) {
+                params.put(URLDecoder.decode(pair[0], StandardCharsets.UTF_8), URLDecoder.decode(pair[1], StandardCharsets.UTF_8));
+            }
+        }
+        return params;
+    }
+
+    private int parseIntOrDefault(String value, int defaultValue) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private Program getCurrentProgram() {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        return pm != null ? pm.getCurrentProgram() : null;
+    }
+
+    private String paginateList(List<String> list, int offset, int limit) {
+        if (offset >= list.size()) {
+            return "[]"; // Empty JSON array
+        }
+        int end = Math.min(offset + limit, list.size());
+        return "[\"" + String.join("\",\"", list.subList(offset, end)) + "\"]";
+    }
+
+    private String escapeNonAscii(String str) {
+        return str.chars()
+                  .mapToObj(c -> c > 127 ? String.format("\\u%04x", c) : "" + (char)c)
+                  .collect(Collectors.joining());
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Dataset Generator endpoint handlers
+    // ----------------------------------------------------------------------------------
+    private void sendDatasetResponseByName(HttpExchange exchange, BiFunction<DatasetGenerator, String, String> generatorFunction) throws IOException {
+        Map<String, String> qparams = parseQueryParams(exchange);
+        String functionName = qparams.get("functionName");
+        String functionPrefix = qparams.get("functionPrefix");
+
+        if (functionName == null || functionName.isEmpty()) {
+            sendResponse(exchange, "{\"error\": \"Missing 'functionName' parameter\"}", 400);
+            return;
+        }
+
+        Program program = getCurrentProgram();
+        if (program == null) {
+            sendResponse(exchange, "{\"error\": \"No program loaded\"}", 503);
+            return;
+        }
+        
+        DatasetGenerator generator = new DatasetGenerator();
+        if (functionPrefix != null) {
+            // Assuming DatasetGenerator has a public field or setter for functionPrefix
+            // generator.functionPrefix = functionPrefix; 
+        }
+        
+        String jsonResponse = generatorFunction.apply(generator, functionName);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        sendResponse(exchange, jsonResponse);
+    }
+    
+    private void sendBinaryMetadataResponse(HttpExchange exchange) throws IOException {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            sendResponse(exchange, "{\"error\": \"No program loaded\"}", 503);
+            return;
+        }
+
+        Map<String, String> qparams = parseQueryParams(exchange);
+        String functionPrefix = qparams.get("functionPrefix");
+        
+        DatasetGenerator generator = new DatasetGenerator();
+        if (functionPrefix != null) {
+            // Assuming DatasetGenerator has a public field or setter for functionPrefix
+            // generator.functionPrefix = functionPrefix;
+        }
+
+        String jsonResponse = generator.getBinaryMetadataJson();
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        sendResponse(exchange, jsonResponse);
     }
 
     // ----------------------------------------------------------------------------------
@@ -530,7 +705,7 @@ public class GhidraMCPPlugin extends Plugin {
                     Msg.error(this, "Error renaming function", e);
                 }
                 finally {
-                    successFlag.set(program.endTransaction(tx, successFlag.get()));
+                    program.endTransaction(tx, successFlag.get());
                 }
             });
         }
@@ -652,7 +827,7 @@ public class GhidraMCPPlugin extends Plugin {
                     Msg.error(this, "Failed to rename variable", e);
                 }
                 finally {
-                    successFlag.set(program.endTransaction(tx, true));
+                    program.endTransaction(tx, successFlag.get());
                 }
             });
         } catch (InterruptedException | InvocationTargetException e) {
@@ -845,7 +1020,7 @@ public class GhidraMCPPlugin extends Plugin {
 
                 result.append(String.format("%s: %s %s\n", 
                     instr.getAddress(), 
-                    instr.toString(),
+                    instr.toString(), 
                     comment));
             }
 
@@ -853,7 +1028,7 @@ public class GhidraMCPPlugin extends Plugin {
         } catch (Exception e) {
             return "Error disassembling function: " + e.getMessage();
         }
-    }    
+    }
 
     /**
      * Set a comment using the specified comment type (PRE_COMMENT or EOL_COMMENT)
@@ -864,7 +1039,6 @@ public class GhidraMCPPlugin extends Plugin {
         if (addressStr == null || addressStr.isEmpty() || comment == null) return false;
 
         AtomicBoolean success = new AtomicBoolean(false);
-
         try {
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction(transactionName);
@@ -875,7 +1049,7 @@ public class GhidraMCPPlugin extends Plugin {
                 } catch (Exception e) {
                     Msg.error(this, "Error setting " + transactionName.toLowerCase(), e);
                 } finally {
-                    success.set(program.endTransaction(tx, success.get()));
+                    program.endTransaction(tx, success.get());
                 }
             });
         } catch (InterruptedException | InvocationTargetException e) {
@@ -884,7 +1058,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         return success.get();
     }
-
+    
     /**
      * Set a comment for a given address in the function pseudocode
      */
@@ -898,7 +1072,7 @@ public class GhidraMCPPlugin extends Plugin {
     private boolean setDisassemblyComment(String addressStr, String comment) {
         return setCommentAtAddress(addressStr, comment, CodeUnit.EOL_COMMENT, "Set disassembly comment");
     }
-
+    
     /**
      * Class to hold the result of a prototype setting operation
      */
@@ -926,13 +1100,11 @@ public class GhidraMCPPlugin extends Plugin {
     private boolean renameFunctionByAddress(String functionAddrStr, String newName) {
         Program program = getCurrentProgram();
         if (program == null) return false;
-        if (functionAddrStr == null || functionAddrStr.isEmpty() || 
-            newName == null || newName.isEmpty()) {
+        if (functionAddrStr == null || functionAddrStr.isEmpty() || newName == null || newName.isEmpty()) {
             return false;
         }
 
         AtomicBoolean success = new AtomicBoolean(false);
-
         try {
             SwingUtilities.invokeAndWait(() -> {
                 performFunctionRename(program, functionAddrStr, newName, success);
@@ -952,12 +1124,10 @@ public class GhidraMCPPlugin extends Plugin {
         try {
             Address addr = program.getAddressFactory().getAddress(functionAddrStr);
             Function func = getFunctionForAddress(program, addr);
-
             if (func == null) {
                 Msg.error(this, "Could not find function at address: " + functionAddrStr);
                 return;
             }
-
             func.setName(newName, SourceType.USER_DEFINED);
             success.set(true);
         } catch (Exception e) {
@@ -985,8 +1155,7 @@ public class GhidraMCPPlugin extends Plugin {
         final AtomicBoolean success = new AtomicBoolean(false);
 
         try {
-            SwingUtilities.invokeAndWait(() -> 
-                applyFunctionPrototype(program, functionAddrStr, prototype, success, errorMessage));
+            SwingUtilities.invokeAndWait(() -> applyFunctionPrototype(program, functionAddrStr, prototype, success, errorMessage));
         } catch (InterruptedException | InvocationTargetException e) {
             String msg = "Failed to set function prototype on Swing thread: " + e.getMessage();
             errorMessage.append(msg);
@@ -999,20 +1168,18 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * Helper method that applies the function prototype within a transaction
      */
-    private void applyFunctionPrototype(Program program, String functionAddrStr, String prototype, 
-                                       AtomicBoolean success, StringBuilder errorMessage) {
+    private void applyFunctionPrototype(Program program, String functionAddrStr, String prototype,
+        AtomicBoolean success, StringBuilder errorMessage) {
         try {
             // Get the address and function
             Address addr = program.getAddressFactory().getAddress(functionAddrStr);
             Function func = getFunctionForAddress(program, addr);
-
             if (func == null) {
                 String msg = "Could not find function at address: " + functionAddrStr;
                 errorMessage.append(msg);
                 Msg.error(this, msg);
                 return;
             }
-
             Msg.info(this, "Setting prototype for function " + func.getName() + ": " + prototype);
 
             // Store original prototype as a comment for reference
@@ -1035,8 +1202,8 @@ public class GhidraMCPPlugin extends Plugin {
         int txComment = program.startTransaction("Add prototype comment");
         try {
             program.getListing().setComment(
-                func.getEntryPoint(), 
-                CodeUnit.PLATE_COMMENT, 
+                func.getEntryPoint(),
+                CodeUnit.PLATE_COMMENT,
                 "Setting prototype: " + prototype
             );
         } finally {
@@ -1048,49 +1215,35 @@ public class GhidraMCPPlugin extends Plugin {
      * Parse and apply the function signature with error handling
      */
     private void parseFunctionSignatureAndApply(Program program, Address addr, String prototype,
-                                              AtomicBoolean success, StringBuilder errorMessage) {
+        AtomicBoolean success, StringBuilder errorMessage) {
         // Use ApplyFunctionSignatureCmd to parse and apply the signature
         int txProto = program.startTransaction("Set function prototype");
         try {
             // Get data type manager
             DataTypeManager dtm = program.getDataTypeManager();
-
             // Get data type manager service
-            ghidra.app.services.DataTypeManagerService dtms = 
-                tool.getService(ghidra.app.services.DataTypeManagerService.class);
-
+            ghidra.app.services.DataTypeManagerService dtms = tool.getService(ghidra.app.services.DataTypeManagerService.class);
             // Create function signature parser
-            ghidra.app.util.parser.FunctionSignatureParser parser = 
-                new ghidra.app.util.parser.FunctionSignatureParser(dtm, dtms);
-
+            ghidra.app.util.parser.FunctionSignatureParser parser = new ghidra.app.util.parser.FunctionSignatureParser(dtm, dtms);
             // Parse the prototype into a function signature
-            ghidra.program.model.data.FunctionDefinitionDataType sig = parser.parse(null, prototype);
+            FunctionDefinition def = parser.parse(null, prototype);
 
-            if (sig == null) {
-                String msg = "Failed to parse function prototype";
+            // Apply the signature
+            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd = new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
+                addr,
+                def,
+                SourceType.USER_DEFINED
+            );
+            
+            if (!cmd.applyTo(program, new ConsoleTaskMonitor())) {
+                String msg = "Failed to apply function signature: " + cmd.getStatusMsg();
                 errorMessage.append(msg);
                 Msg.error(this, msg);
-                return;
-            }
-
-            // Create and apply the command
-            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd = 
-                new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
-                    addr, sig, SourceType.USER_DEFINED);
-
-            // Apply the command to the program
-            boolean cmdResult = cmd.applyTo(program, new ConsoleTaskMonitor());
-
-            if (cmdResult) {
-                success.set(true);
-                Msg.info(this, "Successfully applied function signature");
             } else {
-                String msg = "Command failed: " + cmd.getStatusMsg();
-                errorMessage.append(msg);
-                Msg.error(this, msg);
+                success.set(true);
             }
         } catch (Exception e) {
-            String msg = "Error applying function signature: " + e.getMessage();
+            String msg = "Error parsing function signature: " + e.getMessage();
             errorMessage.append(msg);
             Msg.error(this, msg, e);
         } finally {
@@ -1099,553 +1252,162 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Set a local variable's type using HighFunctionDBUtil.updateDBVariable
+     * Helper to find data type by name in all categories
      */
-    private boolean setLocalVariableType(String functionAddrStr, String variableName, String newType) {
-        // Input validation
+    private DataType findDataTypeByNameInAllCategories(DataTypeManager dtm, String name) {
+        List<DataType> dataTypes = new ArrayList<>();
+        dtm.findDataTypes(name, dataTypes);
+        if (!dataTypes.isEmpty()) {
+            return dataTypes.get(0);
+        }
+        return null; // not found
+    }
+
+    /**
+     * Set the data type of a local variable in a function
+     */
+    private boolean setLocalVariableType(String functionAddrStr, String varName, String newTypeName) {
         Program program = getCurrentProgram();
         if (program == null) return false;
-        if (functionAddrStr == null || functionAddrStr.isEmpty() || 
-            variableName == null || variableName.isEmpty() ||
-            newType == null || newType.isEmpty()) {
-            return false;
-        }
 
         AtomicBoolean success = new AtomicBoolean(false);
 
         try {
-            SwingUtilities.invokeAndWait(() -> 
-                applyVariableType(program, functionAddrStr, variableName, newType, success));
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set local variable type");
+                try {
+                    Address funcAddr = program.getAddressFactory().getAddress(functionAddrStr);
+                    Function func = getFunctionForAddress(program, funcAddr);
+                    if (func == null) {
+                        Msg.error(this, "Function not found at " + functionAddrStr);
+                        return;
+                    }
+
+                    Variable var = findVariableByName(func, varName);
+                    if (var == null) {
+                        Msg.error(this, "Variable '" + varName + "' not found in function " + func.getName());
+                        return;
+                    }
+
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType newType = findDataTypeByNameInAllCategories(dtm, newTypeName);
+                    if (newType == null) {
+                        Msg.error(this, "Data type '" + newTypeName + "' not found");
+                        return;
+                    }
+
+                    SetVariableNameCmd cmd = new SetVariableNameCmd(var, var.getName(), newType, var.getSource());
+                    if (cmd.applyTo(program)) {
+                        success.set(true);
+                    } else {
+                        Msg.error(this, "Failed to set variable type: " + cmd.getStatusMsg());
+                    }
+                } catch (Exception e) {
+                    Msg.error(this, "Error setting local variable type", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
         } catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute set variable type on Swing thread", e);
         }
 
         return success.get();
     }
-
+    
     /**
-     * Helper method that performs the actual variable type change
+     * Helper to find a variable by name in a function (including parameters)
      */
-    private void applyVariableType(Program program, String functionAddrStr, 
-                                  String variableName, String newType, AtomicBoolean success) {
-        try {
-            // Find the function
-            Address addr = program.getAddressFactory().getAddress(functionAddrStr);
-            Function func = getFunctionForAddress(program, addr);
-
-            if (func == null) {
-                Msg.error(this, "Could not find function at address: " + functionAddrStr);
-                return;
-            }
-
-            DecompileResults results = decompileFunction(func, program);
-            if (results == null || !results.decompileCompleted()) {
-                return;
-            }
-
-            ghidra.program.model.pcode.HighFunction highFunction = results.getHighFunction();
-            if (highFunction == null) {
-                Msg.error(this, "No high function available");
-                return;
-            }
-
-            // Find the symbol by name
-            HighSymbol symbol = findSymbolByName(highFunction, variableName);
-            if (symbol == null) {
-                Msg.error(this, "Could not find variable '" + variableName + "' in decompiled function");
-                return;
-            }
-
-            // Get high variable
-            HighVariable highVar = symbol.getHighVariable();
-            if (highVar == null) {
-                Msg.error(this, "No HighVariable found for symbol: " + variableName);
-                return;
-            }
-
-            Msg.info(this, "Found high variable for: " + variableName + 
-                     " with current type " + highVar.getDataType().getName());
-
-            // Find the data type
-            DataTypeManager dtm = program.getDataTypeManager();
-            DataType dataType = resolveDataType(dtm, newType);
-
-            if (dataType == null) {
-                Msg.error(this, "Could not resolve data type: " + newType);
-                return;
-            }
-
-            Msg.info(this, "Using data type: " + dataType.getName() + " for variable " + variableName);
-
-            // Apply the type change in a transaction
-            updateVariableType(program, symbol, dataType, success);
-
-        } catch (Exception e) {
-            Msg.error(this, "Error setting variable type: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Find a high symbol by name in the given high function
-     */
-    private HighSymbol findSymbolByName(ghidra.program.model.pcode.HighFunction highFunction, String variableName) {
-        Iterator<HighSymbol> symbols = highFunction.getLocalSymbolMap().getSymbols();
-        while (symbols.hasNext()) {
-            HighSymbol s = symbols.next();
-            if (s.getName().equals(variableName)) {
-                return s;
+    private Variable findVariableByName(Function func, String varName) {
+        for (Variable var : func.getAllVariables()) {
+            if (var.getName().equals(varName)) {
+                return var;
             }
         }
         return null;
     }
-
+    
     /**
-     * Decompile a function and return the results
-     */
-    private DecompileResults decompileFunction(Function func, Program program) {
-        // Set up decompiler for accessing the decompiled function
-        DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(program);
-        decomp.setSimplificationStyle("decompile"); // Full decompilation
-
-        // Decompile the function
-        DecompileResults results = decomp.decompileFunction(func, 60, new ConsoleTaskMonitor());
-
-        if (!results.decompileCompleted()) {
-            Msg.error(this, "Could not decompile function: " + results.getErrorMessage());
-            return null;
-        }
-
-        return results;
-    }
-
-    /**
-     * Apply the type update in a transaction
-     */
-    private void updateVariableType(Program program, HighSymbol symbol, DataType dataType, AtomicBoolean success) {
-        int tx = program.startTransaction("Set variable type");
-        try {
-            // Use HighFunctionDBUtil to update the variable with the new type
-            HighFunctionDBUtil.updateDBVariable(
-                symbol,                // The high symbol to modify
-                symbol.getName(),      // Keep original name
-                dataType,              // The new data type
-                SourceType.USER_DEFINED // Mark as user-defined
-            );
-
-            success.set(true);
-            Msg.info(this, "Successfully set variable type using HighFunctionDBUtil");
-        } catch (Exception e) {
-            Msg.error(this, "Error setting variable type: " + e.getMessage());
-        } finally {
-            program.endTransaction(tx, success.get());
-        }
-    }
-
-    /**
-     * Get all references to a specific address (xref to)
+     * Get a list of cross-references to a specific address
      */
     private String getXrefsTo(String addressStr, int offset, int limit) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
         if (addressStr == null || addressStr.isEmpty()) return "Address is required";
 
+        List<String> xrefs = new ArrayList<>();
         try {
             Address addr = program.getAddressFactory().getAddress(addressStr);
-            ReferenceManager refManager = program.getReferenceManager();
-            
-            ReferenceIterator refIter = refManager.getReferencesTo(addr);
-            
-            List<String> refs = new ArrayList<>();
-            while (refIter.hasNext()) {
-                Reference ref = refIter.next();
-                Address fromAddr = ref.getFromAddress();
-                RefType refType = ref.getReferenceType();
-                
-                Function fromFunc = program.getFunctionManager().getFunctionContaining(fromAddr);
-                String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
-                
-                refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
+            ReferenceManager refMgr = program.getReferenceManager();
+            for (Reference ref : refMgr.getReferencesTo(addr)) {
+                xrefs.add(String.format("%s (%s)", ref.getFromAddress(), ref.getReferenceType()));
             }
-            
-            return paginateList(refs, offset, limit);
         } catch (Exception e) {
-            return "Error getting references to address: " + e.getMessage();
+            return "Error getting xrefs: " + e.getMessage();
         }
+        return paginateList(xrefs, offset, limit);
     }
 
     /**
-     * Get all references from a specific address (xref from)
+     * Get a list of cross-references from a specific address
      */
     private String getXrefsFrom(String addressStr, int offset, int limit) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
         if (addressStr == null || addressStr.isEmpty()) return "Address is required";
 
+        List<String> xrefs = new ArrayList<>();
         try {
             Address addr = program.getAddressFactory().getAddress(addressStr);
-            ReferenceManager refManager = program.getReferenceManager();
-            
-            Reference[] references = refManager.getReferencesFrom(addr);
-            
-            List<String> refs = new ArrayList<>();
-            for (Reference ref : references) {
-                Address toAddr = ref.getToAddress();
-                RefType refType = ref.getReferenceType();
-                
-                String targetInfo = "";
-                Function toFunc = program.getFunctionManager().getFunctionAt(toAddr);
-                if (toFunc != null) {
-                    targetInfo = " to function " + toFunc.getName();
-                } else {
-                    Data data = program.getListing().getDataAt(toAddr);
-                    if (data != null) {
-                        targetInfo = " to data " + (data.getLabel() != null ? data.getLabel() : data.getPathName());
-                    }
-                }
-                
-                refs.add(String.format("To %s%s [%s]", toAddr, targetInfo, refType.getName()));
+            ReferenceManager refMgr = program.getReferenceManager();
+            for (Reference ref : refMgr.getReferencesFrom(addr)) {
+                xrefs.add(String.format("%s (%s)", ref.getToAddress(), ref.getReferenceType()));
             }
-            
-            return paginateList(refs, offset, limit);
         } catch (Exception e) {
-            return "Error getting references from address: " + e.getMessage();
+            return "Error getting xrefs: " + e.getMessage();
         }
+        return paginateList(xrefs, offset, limit);
+    }
+    
+    /**
+     * Get a list of all cross-references to a function by its name
+     */
+    private String getFunctionXrefs(String name, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        List<String> xrefs = new ArrayList<>();
+        for (Function func : program.getFunctionManager().getFunctions(true)) {
+            if (func.getName().equals(name)) {
+                Address entry = func.getEntryPoint();
+                ReferenceManager refMgr = program.getReferenceManager();
+                for (Reference ref : refMgr.getReferencesTo(entry)) {
+                    xrefs.add(ref.getFromAddress().toString());
+                }
+                break;
+            }
+        }
+        return paginateList(xrefs, offset, limit);
     }
 
     /**
-     * Get all references to a specific function by name
+     * List defined strings in the program
      */
-    private String getFunctionXrefs(String functionName, int offset, int limit) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (functionName == null || functionName.isEmpty()) return "Function name is required";
-
-        try {
-            List<String> refs = new ArrayList<>();
-            FunctionManager funcManager = program.getFunctionManager();
-            for (Function function : funcManager.getFunctions(true)) {
-                if (function.getName().equals(functionName)) {
-                    Address entryPoint = function.getEntryPoint();
-                    ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
-                    
-                    while (refIter.hasNext()) {
-                        Reference ref = refIter.next();
-                        Address fromAddr = ref.getFromAddress();
-                        RefType refType = ref.getReferenceType();
-                        
-                        Function fromFunc = funcManager.getFunctionContaining(fromAddr);
-                        String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
-                        
-                        refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
-                    }
-                }
-            }
-            
-            if (refs.isEmpty()) {
-                return "No references found to function: " + functionName;
-            }
-            
-            return paginateList(refs, offset, limit);
-        } catch (Exception e) {
-            return "Error getting function references: " + e.getMessage();
-        }
-    }
-
-/**
- * List all defined strings in the program with their addresses
- */
     private String listDefinedStrings(int offset, int limit, String filter) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
 
-        List<String> lines = new ArrayList<>();
-        DataIterator dataIt = program.getListing().getDefinedData(true);
-        
-        while (dataIt.hasNext()) {
-            Data data = dataIt.next();
-            
-            if (data != null && isStringData(data)) {
-                String value = data.getValue() != null ? data.getValue().toString() : "";
-                
-                if (filter == null || value.toLowerCase().contains(filter.toLowerCase())) {
-                    String escapedValue = escapeString(value);
-                    lines.add(String.format("%s: \"%s\"", data.getAddress(), escapedValue));
+        List<String> strings = new ArrayList<>();
+        DataIterator it = program.getListing().getDefinedData(true);
+        while (it.hasNext()) {
+            Data data = it.next();
+            if (data.getDataType().getName().toLowerCase().contains("string")) {
+                String val = data.getValue().toString();
+                if (filter == null || val.toLowerCase().contains(filter.toLowerCase())) {
+                    strings.add(String.format("%s: \"%s\"", data.getAddress(), escapeNonAscii(val)));
                 }
             }
         }
-        
-        return paginateList(lines, offset, limit);
-    }
-
-    /**
-     * Check if the given data is a string type
-     */
-    private boolean isStringData(Data data) {
-        if (data == null) return false;
-        
-        DataType dt = data.getDataType();
-        String typeName = dt.getName().toLowerCase();
-        return typeName.contains("string") || typeName.contains("char") || typeName.equals("unicode");
-    }
-
-    /**
-     * Escape special characters in a string for display
-     */
-    private String escapeString(String input) {
-        if (input == null) return "";
-        
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < input.length(); i++) {
-            char c = input.charAt(i);
-            if (c >= 32 && c < 127) {
-                sb.append(c);
-            } else if (c == '\n') {
-                sb.append("\\n");
-            } else if (c == '\r') {
-                sb.append("\\r");
-            } else if (c == '\t') {
-                sb.append("\\t");
-            } else {
-                sb.append(String.format("\\x%02x", (int)c & 0xFF));
-            }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Resolves a data type by name, handling common types and pointer types
-     * @param dtm The data type manager
-     * @param typeName The type name to resolve
-     * @return The resolved DataType, or null if not found
-     */
-    private DataType resolveDataType(DataTypeManager dtm, String typeName) {
-        // First try to find exact match in all categories
-        DataType dataType = findDataTypeByNameInAllCategories(dtm, typeName);
-        if (dataType != null) {
-            Msg.info(this, "Found exact data type match: " + dataType.getPathName());
-            return dataType;
-        }
-
-        // Check for Windows-style pointer types (PXXX)
-        if (typeName.startsWith("P") && typeName.length() > 1) {
-            String baseTypeName = typeName.substring(1);
-
-            // Special case for PVOID
-            if (baseTypeName.equals("VOID")) {
-                return new PointerDataType(dtm.getDataType("/void"));
-            }
-
-            // Try to find the base type
-            DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
-            if (baseType != null) {
-                return new PointerDataType(baseType);
-            }
-
-            Msg.warn(this, "Base type not found for " + typeName + ", defaulting to void*");
-            return new PointerDataType(dtm.getDataType("/void"));
-        }
-
-        // Handle common built-in types
-        switch (typeName.toLowerCase()) {
-            case "int":
-            case "long":
-                return dtm.getDataType("/int");
-            case "uint":
-            case "unsigned int":
-            case "unsigned long":
-            case "dword":
-                return dtm.getDataType("/uint");
-            case "short":
-                return dtm.getDataType("/short");
-            case "ushort":
-            case "unsigned short":
-            case "word":
-                return dtm.getDataType("/ushort");
-            case "char":
-            case "byte":
-                return dtm.getDataType("/char");
-            case "uchar":
-            case "unsigned char":
-                return dtm.getDataType("/uchar");
-            case "longlong":
-            case "__int64":
-                return dtm.getDataType("/longlong");
-            case "ulonglong":
-            case "unsigned __int64":
-                return dtm.getDataType("/ulonglong");
-            case "bool":
-            case "boolean":
-                return dtm.getDataType("/bool");
-            case "void":
-                return dtm.getDataType("/void");
-            default:
-                // Try as a direct path
-                DataType directType = dtm.getDataType("/" + typeName);
-                if (directType != null) {
-                    return directType;
-                }
-
-                // Fallback to int if we couldn't find it
-                Msg.warn(this, "Unknown type: " + typeName + ", defaulting to int");
-                return dtm.getDataType("/int");
-        }
-    }
-    
-    /**
-     * Find a data type by name in all categories/folders of the data type manager
-     * This searches through all categories rather than just the root
-     */
-    private DataType findDataTypeByNameInAllCategories(DataTypeManager dtm, String typeName) {
-        // Try exact match first
-        DataType result = searchByNameInAllCategories(dtm, typeName);
-        if (result != null) {
-            return result;
-        }
-
-        // Try lowercase
-        return searchByNameInAllCategories(dtm, typeName.toLowerCase());
-    }
-
-    /**
-     * Helper method to search for a data type by name in all categories
-     */
-    private DataType searchByNameInAllCategories(DataTypeManager dtm, String name) {
-        // Get all data types from the manager
-        Iterator<DataType> allTypes = dtm.getAllDataTypes();
-        while (allTypes.hasNext()) {
-            DataType dt = allTypes.next();
-            // Check if the name matches exactly (case-sensitive) 
-            if (dt.getName().equals(name)) {
-                return dt;
-            }
-            // For case-insensitive, we want an exact match except for case
-            if (dt.getName().equalsIgnoreCase(name)) {
-                return dt;
-            }
-        }
-        return null;
-    }
-
-    // ----------------------------------------------------------------------------------
-    // Utility: parse query params, parse post params, pagination, etc.
-    // ----------------------------------------------------------------------------------
-
-    /**
-     * Parse query parameters from the URL, e.g. ?offset=10&limit=100
-     */
-    private Map<String, String> parseQueryParams(HttpExchange exchange) {
-        Map<String, String> result = new HashMap<>();
-        String query = exchange.getRequestURI().getQuery(); // e.g. offset=10&limit=100
-        if (query != null) {
-            String[] pairs = query.split("&");
-            for (String p : pairs) {
-                String[] kv = p.split("=");
-                if (kv.length == 2) {
-                    // URL decode parameter values
-                    try {
-                        String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
-                        String value = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
-                        result.put(key, value);
-                    } catch (Exception e) {
-                        Msg.error(this, "Error decoding URL parameter", e);
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Parse post body form params, e.g. oldName=foo&newName=bar
-     */
-    private Map<String, String> parsePostParams(HttpExchange exchange) throws IOException {
-        byte[] body = exchange.getRequestBody().readAllBytes();
-        String bodyStr = new String(body, StandardCharsets.UTF_8);
-        Map<String, String> params = new HashMap<>();
-        for (String pair : bodyStr.split("&")) {
-            String[] kv = pair.split("=");
-            if (kv.length == 2) {
-                // URL decode parameter values
-                try {
-                    String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
-                    String value = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
-                    params.put(key, value);
-                } catch (Exception e) {
-                    Msg.error(this, "Error decoding URL parameter", e);
-                }
-            }
-        }
-        return params;
-    }
-
-    /**
-     * Convert a list of strings into one big newline-delimited string, applying offset & limit.
-     */
-    private String paginateList(List<String> items, int offset, int limit) {
-        int start = Math.max(0, offset);
-        int end   = Math.min(items.size(), offset + limit);
-
-        if (start >= items.size()) {
-            return ""; // no items in range
-        }
-        List<String> sub = items.subList(start, end);
-        return String.join("\n", sub);
-    }
-
-    /**
-     * Parse an integer from a string, or return defaultValue if null/invalid.
-     */
-    private int parseIntOrDefault(String val, int defaultValue) {
-        if (val == null) return defaultValue;
-        try {
-            return Integer.parseInt(val);
-        }
-        catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    /**
-     * Escape non-ASCII chars to avoid potential decode issues.
-     */
-    private String escapeNonAscii(String input) {
-        if (input == null) return "";
-        StringBuilder sb = new StringBuilder();
-        for (char c : input.toCharArray()) {
-            if (c >= 32 && c < 127) {
-                sb.append(c);
-            }
-            else {
-                sb.append("\\x");
-                sb.append(Integer.toHexString(c & 0xFF));
-            }
-        }
-        return sb.toString();
-    }
-
-    public Program getCurrentProgram() {
-        ProgramManager pm = tool.getService(ProgramManager.class);
-        return pm != null ? pm.getCurrentProgram() : null;
-    }
-
-    private void sendResponse(HttpExchange exchange, String response) throws IOException {
-        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-        exchange.sendResponseHeaders(200, bytes.length);
-        try (OutputStream os = exchange.getResponseBody()) {
-            os.write(bytes);
-        }
-    }
-
-    @Override
-    public void dispose() {
-        if (server != null) {
-            Msg.info(this, "Stopping GhidraMCP HTTP server...");
-            server.stop(1); // Stop with a small delay (e.g., 1 second) for connections to finish
-            server = null; // Nullify the reference
-            Msg.info(this, "GhidraMCP HTTP server stopped.");
-        }
-        super.dispose();
+        return paginateList(strings, offset, limit);
     }
 }
