@@ -287,6 +287,162 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
         params["filter"] = filter
     return safe_get("strings", params)
 
+@mcp.tool()
+def get_cfg_overview(function: str = None) -> str:
+    """
+    Generate CFG (Control Flow Graph) overview for functions.
+    
+    Args:
+        function: Optional function name to get CFG for specific function. 
+                 If None, returns CFG for all functions.
+        
+    Returns:
+        Text representation of the CFG in the format:
+        # [CFG_OVERVIEW]
+        # High-level logical structure of the function, derived from CFG and pattern analysis.
+        # FORMAT: BLOCK_LABEL -> [SUCCESSORS]
+        
+        ## Function: function_name
+        ## Entry Point: 0xaddress
+        
+          basic@0xaddress -> [IF_TRUE: basic@0xaddress, IF_FALSE: basic@0xaddress]  ; Conditional
+          basic@0xaddress -> [basic@0xaddress, basic@0xaddress]
+          basic@0xaddress ; Exit Block
+    """
+    params = {}
+    if function:
+        params["function"] = function
+    return safe_get("cfg", params)
+
+# HELIOS Dataset Endpoints
+
+@mcp.tool()
+def get_binary_metadata() -> str:
+    """
+    Get binary metadata information including architecture and executable format.
+    
+    Returns:
+        JSON string containing binary metadata
+    """
+    return safe_get("dataset/binary_metadata")
+
+@mcp.tool()
+def get_blocks_data(function_name: str) -> str:
+    """
+    Get detailed information about basic blocks for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing blocks data
+    """
+    return safe_get("dataset/blocks", {"function_name": function_name})
+
+@mcp.tool()
+def get_calls_data(function_name: str) -> str:
+    """
+    Get function call information for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing calls data
+    """
+    return safe_get("dataset/calls", {"function_name": function_name})
+
+@mcp.tool()
+def get_c_code_data(function_name: str) -> str:
+    """
+    Get decompiled C code for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing C code data
+    """
+    return safe_get("dataset/c_code", {"function_name": function_name})
+
+@mcp.tool()
+def get_cfg_data(function_name: str) -> str:
+    """
+    Get control flow graph data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing CFG data
+    """
+    return safe_get("dataset/cfg", {"function_name": function_name})
+
+@mcp.tool()
+def get_edges_data(function_name: str) -> str:
+    """
+    Get control flow edges data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing edges data
+    """
+    return safe_get("dataset/edges", {"function_name": function_name})
+
+@mcp.tool()
+def get_patterns_data(function_name: str) -> str:
+    """
+    Get detected patterns data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing patterns data
+    """
+    return safe_get("dataset/patterns", {"function_name": function_name})
+
+@mcp.tool()
+def get_p_code_data(function_name: str) -> str:
+    """
+    Get P-code data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing P-code data
+    """
+    return safe_get("dataset/p_code", {"function_name": function_name})
+
+@mcp.tool()
+def get_statistics_data(function_name: str) -> str:
+    """
+    Get statistics data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing statistics data
+    """
+    return safe_get("dataset/statistics", {"function_name": function_name})
+
+@mcp.tool()
+def get_variables_data(function_name: str) -> str:
+    """
+    Get variables data for a specific function.
+    
+    Args:
+        function_name: Name of the function to analyze (can be partial match)
+        
+    Returns:
+        JSON string containing variables data
+    """
+    return safe_get("dataset/variables", {"function_name": function_name})
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,

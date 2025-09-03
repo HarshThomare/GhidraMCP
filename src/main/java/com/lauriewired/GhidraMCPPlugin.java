@@ -55,8 +55,22 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
+
+import ghidra.program.model.block.CodeBlock;
+import ghidra.program.model.block.CodeBlockIterator;
+import ghidra.program.model.block.CodeBlockReference;
+import ghidra.program.model.block.CodeBlockReferenceIterator;
+import ghidra.program.model.block.SimpleBlockModel;
+import ghidra.program.model.pcode.PcodeBlockBasic;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.util.exception.CancelledException;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -70,6 +84,7 @@ public class GhidraMCPPlugin extends Plugin {
     private HttpServer server;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
+    private static final int DEFAULT_PORT = 8080;
     private static final int DEFAULT_PORT = 8080;
 
     public GhidraMCPPlugin(PluginTool tool) {
@@ -340,6 +355,18 @@ public class GhidraMCPPlugin extends Plugin {
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
         });
+
+        // HELIOS dataset endpoints
+        server.createContext("/dataset/binary_metadata", this::sendBinaryMetadataResponse);
+        server.createContext("/dataset/blocks", e -> sendDatasetResponseByName(e, DatasetGenerator::getBlocksJson));
+        server.createContext("/dataset/calls", e -> sendDatasetResponseByName(e, DatasetGenerator::getCallsJson));
+        server.createContext("/dataset/c_code", e -> sendDatasetResponseByName(e, DatasetGenerator::getCCodeJson));
+        server.createContext("/dataset/cfg", e -> sendDatasetResponseByName(e, DatasetGenerator::getCfgJson));
+        server.createContext("/dataset/edges", e -> sendDatasetResponseByName(e, DatasetGenerator::getEdgesJson));
+        server.createContext("/dataset/patterns", e -> sendDatasetResponseByName(e, DatasetGenerator::getPatternsJson));
+        server.createContext("/dataset/p_code", e -> sendDatasetResponseByName(e, DatasetGenerator::getPCodeJson));
+        server.createContext("/dataset/statistics", e -> sendDatasetResponseByName(e, DatasetGenerator::getStatisticsJson));
+        server.createContext("/dataset/variables", e -> sendDatasetResponseByName(e, DatasetGenerator::getVariablesJson))
 
         server.setExecutor(null);
         new Thread(() -> {
@@ -1624,6 +1651,130 @@ public class GhidraMCPPlugin extends Plugin {
         return sb.toString();
     }
 
+    private void sendJsonResponse(HttpExchange exchange, String json) throws IOException {
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    private void sendErrorResponse(HttpExchange exchange, int statusCode, String message) throws IOException {
+        byte[] bytes = message.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    private void sendBinaryMetadataResponse(HttpExchange exchange) throws IOException {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            sendErrorResponse(exchange, 503, "No program loaded");
+            return;
+        }
+
+        DatasetGenerator generator = new DatasetGenerator(program, new ConsoleTaskMonitor());
+        try {
+            String json = generator.getBinaryMetadataJson();
+            sendJsonResponse(exchange, json);
+        } finally {
+            generator.dispose();
+        }
+    }
+
+    private void sendDatasetResponse(HttpExchange exchange, BiFunction<DatasetGenerator, DatasetGenerator.FunctionGraph, String> jsonProducer) throws IOException {
+        Map<String, String> qparams = parseQueryParams(exchange);
+        String addressStr = qparams.get("function_address");
+        if (addressStr == null || addressStr.isEmpty()) {
+            sendErrorResponse(exchange, 400, "Missing 'function_address' parameter");
+            return;
+        }
+
+        Program program = getCurrentProgram();
+        if (program == null) {
+            sendErrorResponse(exchange, 503, "No program loaded");
+            return;
+        }
+
+        Function function;
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            function = program.getFunctionManager().getFunctionContaining(addr);
+            if (function == null) {
+                sendErrorResponse(exchange, 404, "No function found at or containing address: " + addressStr);
+                return;
+            }
+        } catch (Exception e) {
+            sendErrorResponse(exchange, 400, "Invalid address format: " + addressStr);
+            return;
+        }
+
+        DatasetGenerator generator = new DatasetGenerator(program, new ConsoleTaskMonitor());
+        try {
+            DatasetGenerator.FunctionGraph graph = generator.analyzeFunction(function);
+            String json = jsonProducer.apply(generator, graph);
+            sendJsonResponse(exchange, json);
+        } catch (Exception e) {
+            Msg.error(this, "Error generating dataset", e);
+            sendErrorResponse(exchange, 500, "Error generating dataset: " + e.getMessage());
+        } finally {
+            generator.dispose();
+        }
+    }
+
+    private void sendDatasetResponseByName(HttpExchange exchange, BiFunction<DatasetGenerator, DatasetGenerator.FunctionGraph, String> jsonProducer) throws IOException {
+        Map<String, String> qparams = parseQueryParams(exchange);
+        String functionName = qparams.get("function_name");
+        if (functionName == null || functionName.isEmpty()) {
+            sendErrorResponse(exchange, 400, "Missing 'function_name' parameter");
+            return;
+        }
+
+        Program program = getCurrentProgram();
+        if (program == null) {
+            sendErrorResponse(exchange, 503, "No program loaded");
+            return;
+        }
+
+        Function function = findFunctionByName(program, functionName);
+        if (function == null) {
+            sendErrorResponse(exchange, 404, "No function found matching name: " + functionName);
+            return;
+        }
+
+        DatasetGenerator generator = new DatasetGenerator(program, new ConsoleTaskMonitor());
+        try {
+            DatasetGenerator.FunctionGraph graph = generator.analyzeFunction(function);
+            String json = jsonProducer.apply(generator, graph);
+            sendJsonResponse(exchange, json);
+        } catch (Exception e) {
+            Msg.error(this, "Error generating dataset", e);
+            sendErrorResponse(exchange, 500, "Error generating dataset: " + e.getMessage());
+        } finally {
+            generator.dispose();
+        }
+    }
+
+    private Function findFunctionByName(Program program, String functionName) {
+        // First try exact match
+        Function function = program.getFunctionManager().getFunction(functionName);
+        if (function != null) {
+            return function;
+        }
+
+        // If no exact match, try partial match
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            if (f.getName().toLowerCase().contains(functionName.toLowerCase())) {
+                return f;
+            }
+        }
+
+        return null;
+    }
+
     public Program getCurrentProgram() {
         ProgramManager pm = tool.getService(ProgramManager.class);
         return pm != null ? pm.getCurrentProgram() : null;
@@ -1647,5 +1798,406 @@ public class GhidraMCPPlugin extends Plugin {
             Msg.info(this, "GhidraMCP HTTP server stopped.");
         }
         super.dispose();
+    }
+
+    private static class DatasetGenerator {
+
+        private final Program program;
+        private final DecompInterface decompInterface;
+        private final TaskMonitor monitor;
+
+        // --- Data Structures ---
+        record BlockInfo(String address, int size, int num_instructions, int num_branches, boolean is_entry, boolean is_exit) {}
+        record EdgeInfo(String source, String target, String edgeType, boolean isConditional) {}
+        record Pattern(String type, String start_block, String end_block, Map<String, String> attributes) {}
+        record Variable(String address, int size, String varType, boolean isConstant, boolean isRegister, boolean isUnique, boolean isAddress, String value) {}
+
+        static class FunctionGraph {
+            final String name;
+            final Map<String, BlockInfo> blocks = new LinkedHashMap<>();
+            final List<EdgeInfo> edges = new ArrayList<>();
+            final Map<String, Variable> variables = new LinkedHashMap<>();
+            final List<Pattern> patterns = new ArrayList<>();
+            final Map<String, List<String>> bbPcode = new HashMap<>();
+            String cCode = "";
+            final StringBuilder pCode = new StringBuilder();
+
+            FunctionGraph(String name) {
+                this.name = name;
+            }
+        }
+
+        public DatasetGenerator(Program program, TaskMonitor monitor) {
+            this.program = program;
+            this.monitor = monitor;
+            this.decompInterface = setUpDecompiler(program);
+        }
+
+        public void dispose() {
+            if (decompInterface != null) {
+                decompInterface.dispose();
+            }
+        }
+
+        private DecompInterface setUpDecompiler(Program prog) {
+            DecompInterface decompilerInterface = new DecompInterface();
+
+            if (!decompilerInterface.openProgram(prog)) {
+                System.out.print("Decompile Error: " + decompilerInterface.getLastMessage());
+                return null;
+            }
+
+            DecompileOptions options = new DecompileOptions();
+            decompilerInterface.setOptions(options);
+            decompilerInterface.toggleCCode(true);
+            decompilerInterface.toggleSyntaxTree(true);
+            decompilerInterface.setSimplificationStyle("decompile");
+
+            return decompilerInterface;
+        }
+
+        public FunctionGraph analyzeFunction(Function function) throws CancelledException {
+            FunctionGraph funcGraph = new FunctionGraph(function.getName());
+
+            extractPCode(function, funcGraph);
+            extractCCode(function, funcGraph);
+            extractBasicBlockInfo(function, funcGraph);
+            extractBlockEdges(function, funcGraph);
+            extractPatterns(function, funcGraph);
+            extractVarnodes(function, funcGraph);
+
+            return funcGraph;
+        }
+
+        public String getBinaryMetadataJson() {
+            Map<String, String> binaryMetadata = new LinkedHashMap<>();
+            binaryMetadata.put("architecture", program.getLanguageID().getIdAsString());
+            binaryMetadata.put("executable_format", program.getExecutableFormat());
+            return Json.toString(binaryMetadata);
+        }
+
+        public String getBlocksJson(FunctionGraph funcGraph) {
+            return Json.toString(funcGraph.blocks.values());
+        }
+        
+        public String getCallsJson(FunctionGraph funcGraph) {
+            Map<String, Object> calls = new LinkedHashMap<>();
+            calls.put("incoming", new ArrayList<>());
+            calls.put("outgoing", new ArrayList<>());
+            return Json.toString(calls);
+        }
+        
+        public String getCCodeJson(FunctionGraph funcGraph) {
+            Map<String, String> ccode = new LinkedHashMap<>();
+            ccode.put("code", funcGraph.cCode);
+            ccode.put("language", "C");
+            return Json.toString(ccode);
+        }
+
+        public String getCfgJson(FunctionGraph funcGraph) {
+            Map<String, String> blockAddrToLabel = new HashMap<>();
+            int i = 0;
+            for (String addr : funcGraph.blocks.keySet()) {
+                blockAddrToLabel.put(addr, "BLOCK_" + (i++));
+            }
+
+            Map<String, Object> cfg = new LinkedHashMap<>();
+            Map<String, Object> blocksData = new LinkedHashMap<>();
+
+            for (BlockInfo block : funcGraph.blocks.values()) {
+                String label = blockAddrToLabel.get(block.address());
+                Set<String> types = new HashSet<>();
+                if (block.is_entry()) types.add("entry");
+                if (block.is_exit()) types.add("exit");
+                
+                for (Pattern p : funcGraph.patterns) {
+                    if (p.start_block().equals(block.address())) {
+                        if ("loop".equalsIgnoreCase(p.type())) types.add("loop_header");
+                        else if ("conditional".equalsIgnoreCase(p.type())) types.add("conditional");
+                    }
+                }
+
+                List<String> pcodeLines = funcGraph.bbPcode.getOrDefault(block.address(), Collections.emptyList());
+                Set<String> calls = new HashSet<>();
+                for (String pcode : pcodeLines) {
+                    String[] parts = pcode.split("\\s+");
+                    if (parts.length > 1 && (parts[0].equals("CALL") || parts[0].equals("CALLIND"))) {
+                        calls.add(parts[1]);
+                    }
+                }
+
+                Map<String, Object> blockDetails = new LinkedHashMap<>();
+                blockDetails.put("address", block.address());
+                blockDetails.put("type", new ArrayList<>(types));
+                blockDetails.put("calls", calls.stream().sorted().collect(Collectors.toList()));
+                blockDetails.put("out_edges", funcGraph.edges.stream()
+                    .filter(e -> e.source().equals(block.address()) && blockAddrToLabel.containsKey(e.target()))
+                    .map(e -> blockAddrToLabel.get(e.target()))
+                    .collect(Collectors.toList()));
+                blockDetails.put("pcode", pcodeLines);
+
+                blocksData.put(label, blockDetails);
+            }
+            cfg.put("blocks", blocksData);
+            return Json.toString(cfg);
+        }
+        
+        public String getEdgesJson(FunctionGraph funcGraph) {
+            return Json.toString(funcGraph.edges);
+        }
+
+        public String getPatternsJson(FunctionGraph funcGraph) {
+            return Json.toString(funcGraph.patterns);
+        }
+        
+        public String getPCodeJson(FunctionGraph funcGraph) {
+            Map<String, String> pcode = new LinkedHashMap<>();
+            pcode.put("code", funcGraph.pCode.toString());
+            pcode.put("language", "P-code");
+            return Json.toString(pcode);
+        }
+        
+        public String getStatisticsJson(FunctionGraph funcGraph) {
+            Map<String, Integer> stats = new LinkedHashMap<>();
+            stats.put("num_blocks", funcGraph.blocks.size());
+            stats.put("num_edges", funcGraph.edges.size());
+            stats.put("num_variables", funcGraph.variables.size());
+            stats.put("num_patterns", funcGraph.patterns.size());
+            return Json.toString(stats);
+        }
+
+        public String getVariablesJson(FunctionGraph funcGraph) {
+            return Json.toString(funcGraph.variables.values());
+        }
+
+        // --- Data Extraction Methods ---
+        private void extractPCode(Function function, FunctionGraph funcGraph) {
+            HighFunction hf = decompileFunction(function);
+            if (hf == null) return;
+            
+            for (PcodeBlockBasic bb : hf.getBasicBlocks()) {
+                String bbAddress = "0x" + bb.getStart().getOffset();
+                List<String> pcodeLines = new ArrayList<>();
+                Iterator<PcodeOp> opIter = bb.getIterator();
+                while(opIter.hasNext()) {
+                    String pcode = opIter.next().toString();
+                    pcodeLines.add(pcode);
+                    funcGraph.pCode.append(pcode).append("\n");
+                }
+                funcGraph.bbPcode.put(bbAddress, pcodeLines);
+            }
+        }
+
+        private void extractCCode(Function function, FunctionGraph funcGraph) {
+            DecompileResults results = decompInterface.decompileFunction(function, decompInterface.getOptions().getDefaultTimeout(), TaskMonitor.DUMMY);
+            if (results != null && results.decompileCompleted()) {
+                funcGraph.cCode = results.getDecompiledFunction().getC();
+            }
+        }
+        
+        private void extractBasicBlockInfo(Function function, FunctionGraph funcGraph) throws CancelledException {
+            if (function == null || function.getBody() == null) return;
+
+            SimpleBlockModel bbModel = new SimpleBlockModel(program);
+            CodeBlockIterator blocks = bbModel.getCodeBlocksContaining(function.getBody(), monitor);
+
+            while (blocks.hasNext()) {
+                CodeBlock block = blocks.next();
+                String blockAddrStr = "0x" + block.getMinAddress().getOffset();
+                int blockSize = (int) block.getNumAddresses();
+                boolean isEntry = block.getMinAddress().equals(function.getEntryPoint());
+                boolean isExit = !block.getDestinations(monitor).hasNext();
+
+                int numInstructions = 0;
+                int numBranches = 0;
+                InstructionIterator iter = program.getListing().getInstructions(block, true);
+                while (iter.hasNext()) {
+                    Instruction instr = iter.next();
+                    numInstructions++;
+                    if (instr.getFlowType().isTerminal() || instr.getFlowType().isCall() || instr.getFlowType().isJump()) {
+                        numBranches++;
+                    }
+                }
+                
+                BlockInfo blockInfo = new BlockInfo(blockAddrStr, blockSize, numInstructions, numBranches, isEntry, isExit);
+                funcGraph.blocks.put(blockAddrStr, blockInfo);
+            }
+        }
+
+        private void extractBlockEdges(Function function, FunctionGraph funcGraph) throws CancelledException {
+            if (function == null || function.getBody() == null) return;
+
+            SimpleBlockModel bbModel = new SimpleBlockModel(program);
+            CodeBlockIterator blocks = bbModel.getCodeBlocksContaining(function.getBody(), monitor);
+
+            while (blocks.hasNext()) {
+                CodeBlock sourceBlock = blocks.next();
+                String sourceAddr = "0x" + sourceBlock.getMinAddress().getOffset();
+
+                CodeBlockReferenceIterator dests = sourceBlock.getDestinations(monitor);
+                while (dests.hasNext()) {
+                    CodeBlockReference dest = dests.next();
+                    CodeBlock targetBlock = dest.getDestinationBlock();
+                    
+                    if (!function.getBody().contains(targetBlock.getMinAddress())) continue;
+
+                    String targetAddr = "0x" + targetBlock.getMinAddress().getOffset();
+                    FlowType flowType = dest.getFlowType();
+                    String edgeType = flowType.isFallthrough() ? "FALLTHROUGH" : flowType.getName().toUpperCase();
+                    boolean isConditional = flowType.isConditional();
+
+                    funcGraph.edges.add(new EdgeInfo(sourceAddr, targetAddr, edgeType, isConditional));
+                }
+            }
+        }
+        
+        private void extractVarnodes(Function function, FunctionGraph funcGraph) {
+            HighFunction hf = decompileFunction(function);
+            if (hf == null) return;
+
+            for (PcodeBlockBasic bb : hf.getBasicBlocks()) {
+                Iterator<PcodeOp> piter = bb.getIterator();
+                while (piter.hasNext()) {
+                    PcodeOp op = piter.next();
+                    addVarnode(op.getOutput(), funcGraph);
+                    for(Varnode input : op.getInputs()) {
+                        addVarnode(input, funcGraph);
+                    }
+                }
+            }
+        }
+
+        private void addVarnode(Varnode vn, FunctionGraph fg) {
+            if (vn == null) return;
+            String addr = vn.getAddress().toString();
+            if (fg.variables.containsKey(addr)) return;
+
+            String typeName = "unknown";
+            if (vn.getHigh() != null && vn.getHigh().getDataType() != null) {
+                typeName = vn.getHigh().getDataType().getName();
+            }
+            
+            Variable v = new Variable(addr, vn.getSize(), typeName, vn.isConstant(), vn.isRegister(), vn.isUnique(), vn.isAddress(), Long.toString(vn.getOffset()));
+            fg.variables.put(addr, v);
+        }
+        
+        private void extractPatterns(Function function, FunctionGraph funcGraph) {
+            HighFunction hf = decompileFunction(function);
+            if (hf == null) return;
+
+            List<PcodeBlockBasic> basicBlocks = hf.getBasicBlocks();
+            Map<PcodeBlockBasic, List<PcodeBlockBasic>> successors = new HashMap<>();
+            for (PcodeBlockBasic bb : basicBlocks) {
+                List<PcodeBlockBasic> succs = new ArrayList<>();
+                for (int i = 0; i < bb.getOutSize(); i++) {
+                    succs.add((PcodeBlockBasic) bb.getOut(i));
+                }
+                successors.put(bb, succs);
+            }
+
+            Set<PcodeBlockBasic> visited = new HashSet<>();
+            Set<PcodeBlockBasic> recursionStack = new HashSet<>();
+            for (PcodeBlockBasic bb : basicBlocks) {
+                if (!visited.contains(bb)) {
+                    detectLoopsDFS(bb, visited, recursionStack, successors, funcGraph);
+                }
+            }
+
+            for (PcodeBlockBasic bb : basicBlocks) {
+                if (bb.getOutSize() > 1) {
+                    String startBlock = "0x" + bb.getStart().getOffset();
+                    Map<String, String> attrs = new HashMap<>();
+                    
+                    List<String> succAddresses = new ArrayList<>();
+                    for (int i = 0; i < bb.getOutSize(); i++) {
+                         succAddresses.add("0x" + bb.getOut(i).getStart().getOffset());
+                    }
+                    attrs.put("successors", String.join(",", succAddresses));
+                    funcGraph.patterns.add(new Pattern("conditional", startBlock, startBlock, attrs));
+                }
+            }
+        }
+
+        private void detectLoopsDFS(PcodeBlockBasic current, Set<PcodeBlockBasic> visited, Set<PcodeBlockBasic> recursionStack, Map<PcodeBlockBasic, List<PcodeBlockBasic>> successors, FunctionGraph funcGraph) {
+            visited.add(current);
+            recursionStack.add(current);
+
+            for (PcodeBlockBasic succ : successors.getOrDefault(current, Collections.emptyList())) {
+                if (!visited.contains(succ)) {
+                    detectLoopsDFS(succ, visited, recursionStack, successors, funcGraph);
+                } else if (recursionStack.contains(succ)) {
+                    String headerBlockAddr = "0x" + succ.getStart().getOffset();
+                    String latchBlockAddr = "0x" + current.getStart().getOffset();
+                    Map<String, String> attrs = new HashMap<>();
+                    attrs.put("header", headerBlockAddr);
+                    attrs.put("latch", latchBlockAddr);
+                    funcGraph.patterns.add(new Pattern("loop", headerBlockAddr, latchBlockAddr, attrs));
+                }
+            }
+            recursionStack.remove(current);
+        }
+
+        private HighFunction decompileFunction(Function function) {
+            try {
+                DecompileResults results = decompInterface.decompileFunction(function, decompInterface.getOptions().getDefaultTimeout(), TaskMonitor.DUMMY);
+                if (results != null && results.decompileCompleted()) {
+                    return results.getHighFunction();
+                }
+            } catch (Exception e) {
+                // Log this instead of printing to console
+            }
+            return null;
+        }
+
+        /**
+         * Custom JSON serializer for pretty-printing.
+         */
+        static class Json {
+            public static String toString(Object obj) {
+                return toJson(obj, 0);
+            }
+
+            private static String toJson(Object obj, int indent) {
+                if (obj == null) return "null";
+                if (obj instanceof String) return "\"" + obj.toString().replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
+                if (obj instanceof Number || obj instanceof Boolean) return obj.toString();
+                
+                if (obj instanceof Map) {
+                    Map<?, ?> map = (Map<?, ?>) obj;
+                    if (map.isEmpty()) return "{}";
+                    String indentStr = "\n" + "  ".repeat(indent + 1);
+                    String result = "{" + indentStr;
+                    result += map.entrySet().stream()
+                        .map(e -> "\"" + e.getKey() + "\": " + toJson(e.getValue(), indent + 1))
+                        .collect(Collectors.joining("," + indentStr));
+                    return result + "\n" + "  ".repeat(indent) + "}";
+                }
+                
+                if (obj instanceof Collection) {
+                    Collection<?> coll = (Collection<?>) obj;
+                    if (coll.isEmpty()) return "[]";
+                    String indentStr = "\n" + "  ".repeat(indent + 1);
+                    String result = "[" + indentStr;
+                    result += coll.stream()
+                        .map(item -> toJson(item, indent + 1))
+                        .collect(Collectors.joining("," + indentStr));
+                    return result + "\n" + "  ".repeat(indent) + "]";
+                }
+
+                if (obj.getClass().isRecord()) {
+                     try {
+                        Map<String, Object> map = new LinkedHashMap<>();
+                        for (var component : obj.getClass().getRecordComponents()) {
+                            map.put(component.getName(), component.getAccessor().invoke(obj));
+                        }
+                        return toJson(map, indent);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to serialize record", e);
+                    }
+                }
+                
+                return "\"" + obj.toString() + "\"";
+            }
+        }
     }
 }
